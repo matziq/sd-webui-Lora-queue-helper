@@ -4,7 +4,6 @@ A script that helps you generate a batch of Lora, using the same prompt & settin
 
 Helpful to compare Lora for the same character with identical prompt & settings / Generate different characters from the same source (like the sample picture) / Or just switch and pick Lora easily without changing the tab.
 
-
 ![UI screenshot](https://raw.githubusercontent.com/Yinzo/sd-webui-Lora-queue-helper/main/docs/ui.png)
 ![Output sample](https://raw.githubusercontent.com/Yinzo/sd-webui-Lora-queue-helper/main/docs/output_sample.png)
 
@@ -19,6 +18,8 @@ This fork adds a few quality-of-life improvements for browsing and queueing LoRA
 - Refresh button for the LoRA list
 - Filter textbox (with clear and “show checked” helpers)
 - Sorting: alphabetical (toggle A–Z / Z–A), by file date, and random
+
+![Fork toolbar illustration (refresh/filter/sort)](docs/fork_toolbar.svg)
 
 ### Upstream
 

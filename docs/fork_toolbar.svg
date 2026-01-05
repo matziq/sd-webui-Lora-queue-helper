@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="260" viewBox="0 0 1200 260">
+  <defs>
+    <style>
+      .bg { fill: #0d1117; }
+      .panel { fill: #161b22; stroke: #30363d; stroke-width: 2; rx: 14; }
+      .btn { fill: #21262d; stroke: #30363d; stroke-width: 2; rx: 10; }
+      .btnText { fill: #c9d1d9; font: 600 18px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+      .label { fill: #8b949e; font: 14px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+      .title { fill: #c9d1d9; font: 700 20px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+      .pill { fill: #238636; rx: 999; }
+      .pillText { fill: #ffffff; font: 700 13px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+      .hint { fill: #8b949e; font: 12px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1200" height="260" />
+
+  <text class="title" x="24" y="34">LoRA Queue Helper (fork UI illustration)</text>
+  <rect class="pill" x="445" y="16" width="112" height="24" />
+  <text class="pillText" x="458" y="33">Illustration</text>
+  <text class="hint" x="24" y="56">Shows the fork’s toolbar/filter/sort controls (not a literal screenshot).</text>
+
+  <rect class="panel" x="20" y="78" width="1160" height="160" />
+
+  <!-- Toolbar row -->
+  <text class="label" x="40" y="108">Toolbar</text>
+
+  <!-- Buttons -->
+  <g transform="translate(40,120)">
+    <rect class="btn" x="0" y="0" width="118" height="44" />
+    <text class="btnText" x="18" y="28">🔄 Refresh</text>
+
+    <rect class="btn" x="132" y="0" width="74" height="44" />
+    <text class="btnText" x="154" y="28">All</text>
+
+    <rect class="btn" x="220" y="0" width="88" height="44" />
+    <text class="btnText" x="242" y="28">Clear</text>
+
+    <rect class="btn" x="322" y="0" width="176" height="44" />
+    <text class="btnText" x="342" y="28">📝 Alpha (A–Z)</text>
+
+    <rect class="btn" x="512" y="0" width="152" height="44" />
+    <text class="btnText" x="532" y="28">📅 New→Old</text>
+
+    <rect class="btn" x="678" y="0" width="152" height="44" />
+    <text class="btnText" x="698" y="28">📅 Old→New</text>
+
+    <rect class="btn" x="844" y="0" width="140" height="44" />
+    <text class="btnText" x="864" y="28">🎲 Random</text>
+  </g>
+
+  <!-- Filter row -->
+  <text class="label" x="40" y="196">Filter</text>
+
+  <g transform="translate(40,208)">
+    <rect class="btn" x="0" y="0" width="520" height="44" />
+    <text class="btnText" x="16" y="28" fill="#8b949e">Type to filter LoRA names…</text>
+
+    <rect class="btn" x="536" y="0" width="150" height="44" />
+    <text class="btnText" x="560" y="28">Clear Filter</text>
+
+    <rect class="btn" x="700" y="0" width="170" height="44" />
+    <text class="btnText" x="722" y="28">Show Checked</text>
+  </g>
+</svg>
