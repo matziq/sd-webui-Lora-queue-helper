@@ -3,24 +3,55 @@ import json
 import copy
 import random
 import math
+import time
 
 import gradio as gr
-from PIL import Image, ImageDraw, ImageFont
 
 from modules import sd_samplers, errors, scripts, images, sd_models
-from modules.paths_internal import roboto_ttf_file
 from modules.processing import Processed, process_images
 from modules.shared import state, cmd_opts, opts
 from pathlib import Path
 
 lora_dir = Path(cmd_opts.lora_dir).resolve()
 
+# preserve original os.listdir and replace with a version that can sort entries by modification time or alphabetically
+_orig_listdir = os.listdir
+_alpha_mode = 0  # 0: A-Z, 1: Z-A
+_date_mode = 1   # 0: newest first, 1: oldest first
+_current_sort_type = "alpha"  # "alpha", "date", or "random"
+
+def _listdir_sorted(path):
+    try:
+        entries = _orig_listdir(path)
+    except Exception:
+        # fall back to original behavior on error
+        return _orig_listdir(path)
+
+    try:
+        if _current_sort_type == "alpha":
+            if _alpha_mode == 0:  # A-Z
+                entries.sort()
+            else:  # Z-A
+                entries.sort(reverse=True)
+        elif _current_sort_type == "date":
+            if _date_mode == 0:  # newest first
+                entries.sort(key=lambda e: os.path.getmtime(os.path.join(path, e)) if os.path.exists(os.path.join(path, e)) else -1, reverse=True)
+            else:  # oldest first
+                entries.sort(key=lambda e: os.path.getmtime(os.path.join(path, e)) if os.path.exists(os.path.join(path, e)) else float('inf'), reverse=False)
+        elif _current_sort_type == "random":
+            random.shuffle(entries)
+    except Exception:
+        # if anything goes wrong, return unsorted entries
+        return entries
+    
+    return entries
+
+# Apply the monkey-patch so subsequent os.listdir calls return sorted entries
+os.listdir = _listdir_sorted
+
 
 def allowed_path(path):
     return Path(path).resolve().is_relative_to(lora_dir)
-
-def get_base_path(is_use_custom_path, custom_path):
-    return lora_dir.joinpath(custom_path) if is_use_custom_path else lora_dir
 
 def is_directory_contain_lora(path):
     try:
@@ -35,7 +66,7 @@ def is_directory_contain_lora(path):
     return False
 
 def get_directories(base_path, include_root=True):
-    directories = ["/"] if include_root else []
+    directories = []
     try:
         if allowed_path(base_path):
             for entry in os.listdir(base_path):
@@ -92,72 +123,74 @@ def get_lora_prompt(lora_path, json_path):
 
     return output
 
-def image_grid_with_text(imgs, texts, rows=None, cols=None, font_path=None, font_size=20, text_color="#FFFFFF", stroke_color="#000000", stroke_width=2, add_text=True):
-    if rows is None:
-        rows = math.sqrt(len(imgs))
-        rows = round(rows)
-
-    if cols is None:
-        cols = math.ceil(len(imgs) / rows)
-
-    w, h = imgs[0].size
-    grid = Image.new('RGB', size=(cols * w, rows * h), color='black')
-
-    for i, img in enumerate(imgs):
-        grid.paste(img, box=(i % cols * w, i // cols * h))
-    
-    if add_text:
-        draw = ImageDraw.Draw(grid)
-        
-        font = None
-        if font_path:
-            if os.path.exists(font_path):
-                try:
-                    font = ImageFont.truetype(font_path, font_size)
-                except IOError as e:
-                    print(f"Error loading font from {font_path}: {e}. Using default font.")
-            else:
-                print(f"Font file not found at {font_path}. Using default font.")
-
-        if font is None:
-            font = ImageFont.truetype(roboto_ttf_file, font_size)
-
-        for i, text in enumerate(texts):
-            x = (i % cols) * w
-            y = (i // cols) * h
-            draw_text_with_stroke(draw, text, (x+5, y+5), font, text_color, stroke_color, stroke_width)
-
-    return grid
-
-def draw_text_with_stroke(draw, text, position, font, text_color, stroke_color, stroke_width):
-    x, y = position
-    # draw stroke
-    for dx, dy in [(j, k) for j in range(-stroke_width, stroke_width + 1) for k in range(-stroke_width, stroke_width + 1)]:
-        draw.text((x + dx, y + dy), text, font=font, fill=stroke_color)
-    # draw text
-    draw.text((x, y), text, font=font, fill=text_color)
-# end
-
 class Script(scripts.Script):
+    sorting_priority = 10  # Add sorting priority like other Forge scripts
+    
     def title(self):
         return "Apply on every Lora"
 
+    def show(self, is_img2img):
+        return scripts.AlwaysVisible  # Back to AlwaysVisible like other Forge scripts
+
     def ui(self, is_img2img):
-        def update_dirs(is_use_custom_path, custom_path):
-            base_path = get_base_path(is_use_custom_path, custom_path)
-            dirs = get_directories(base_path)
+        def refresh_loras(current_selected, directories, filter_text=""):
+            """Refresh the LoRA list by forcing a fresh directory read"""
+            global _orig_listdir
+            os.listdir = _orig_listdir
+            try:
+                base_path = lora_dir  # Always use the default lora_dir
+                all_dirs = get_directories(base_path)
+                preserved_directories = [d for d in (directories or []) if d in all_dirs]
+
+                all_loras = get_lora(base_path, preserved_directories)
+
+                if filter_text.strip():
+                    filtered_loras = [lora for lora in all_loras if filter_text.lower() in lora.lower()]
+                else:
+                    filtered_loras = all_loras
+
+                # Deduplicate while preserving order so new files appear only once
+                filtered_loras = list(dict.fromkeys(filtered_loras))
+
+                visible = len(filtered_loras) > 0
+                preserved_selections = [lora for lora in (current_selected or []) if lora in all_loras]
+
+                return (
+                    gr.CheckboxGroup.update(choices=all_dirs, value=preserved_directories),
+                    gr.CheckboxGroup.update(choices=filtered_loras, value=preserved_selections, visible=visible),
+                    gr.Button.update(visible=visible),
+                    gr.Button.update(visible=visible)
+                )
+            finally:
+                os.listdir = _listdir_sorted
+
+        def update_dirs():
+            # Temporarily restore original listdir to force fresh read
+            global _orig_listdir
+            os.listdir = _orig_listdir
+            
+            dirs = get_directories(lora_dir)  # Always use the default lora_dir
+            
+            # Restore the sorted listdir
+            os.listdir = _listdir_sorted
+            
             return gr.CheckboxGroup.update(choices=dirs, value=[])
 
-        def show_dir_textbox(enabled, custom_path):
-            all_dirs = get_directories(lora_dir.joinpath(custom_path) if enabled else lora_dir)
-            return gr.Textbox.update(visible=enabled), gr.CheckboxGroup.update(choices=all_dirs, value=[])
+        def show_dir_textbox_dummy():
+            # This function is no longer needed but kept for compatibility
+            return gr.Textbox.update(visible=False), gr.CheckboxGroup.update()
 
         def get_lora(base_path, directories):
             all_loras = []
 
+            # If no directories are selected, check the base path directly
+            if not directories:
+                if allowed_path(base_path):
+                    safetensor_files = [f for f in os.listdir(base_path) if f.endswith('.safetensors')]
+                    all_loras.extend([os.path.splitext(f)[0] for f in safetensor_files])
+
             for directory in directories:
-                # if directory is "/" use base_path
-                directory = base_path if directory == "/" else os.path.join(base_path, directory)
+                directory = os.path.join(base_path, directory)
                 if not allowed_path(directory):
                     continue
                 safetensor_files = [f for f in os.listdir(directory) if f.endswith('.safetensors')]
@@ -165,204 +198,447 @@ class Script(scripts.Script):
 
             return all_loras
 
-        def update_loras(current_selected, is_use_custom_path, custom_path, directories):
-            base_path = get_base_path(is_use_custom_path, custom_path)
+        def update_loras(current_selected, directories, filter_text=""):
+            base_path = lora_dir  # Always use the default lora_dir
             all_loras = get_lora(base_path, directories)
-            visible = len(all_loras) > 0
-            new_values = [lora for lora in all_loras if lora in current_selected]
-            return gr.CheckboxGroup.update(choices=all_loras, value=new_values, visible=visible), gr.Button.update(
-                visible=visible), gr.Button.update(visible=visible)
+            
+            # Apply filter if filter_text is provided
+            if filter_text.strip():
+                filtered_loras = [lora for lora in all_loras if filter_text.lower() in lora.lower()]
+            else:
+                filtered_loras = all_loras
+            
+            visible = len(filtered_loras) > 0
+            # Preserve all current selections, even those not currently visible due to filtering
+            # Only valid LoRAs (those that exist in all_loras) should be kept in selection
+            preserved_selections = [lora for lora in current_selected if lora in all_loras]
+            
+            return (
+                gr.CheckboxGroup.update(choices=filtered_loras, value=preserved_selections, visible=visible),
+                gr.Button.update(visible=visible),
+                gr.Button.update(visible=visible)
+            )
 
-        def select_all_dirs(is_use_custom_path, custom_path):
-            base_path = get_base_path(is_use_custom_path, custom_path)
-            all_dirs = get_directories(base_path)
-            return gr.CheckboxGroup.update(value=all_dirs)
+        def filter_loras(filter_text, current_selected, directories):
+            """Filter LoRAs based on the filter text"""
+            return update_loras(current_selected, directories, filter_text)
 
-        def deselect_all_dirs():
-            return gr.CheckboxGroup.update(value=[])
-
-        def select_all_lora(is_use_custom_path, custom_path, directories):
-            base_path = get_base_path(is_use_custom_path, custom_path)
+        def clear_filter(current_selected, directories):
+            """Clear the filter and return all LoRAs"""
+            base_path = lora_dir  # Always use the default lora_dir
             all_loras = get_lora(base_path, directories)
-            return gr.CheckboxGroup.update(value=all_loras)
+            preserved_selections = [lora for lora in current_selected if lora in all_loras]
+            
+            return (
+                gr.CheckboxGroup.update(choices=all_loras, value=preserved_selections, visible=len(all_loras) > 0),
+                gr.Button.update(visible=len(all_loras) > 0),
+                gr.Button.update(visible=len(all_loras) > 0),
+                ""  # Clear the filter text
+            )
+
+        def show_checked_only(current_selected, directories):
+            """Show only the currently checked LoRAs"""
+            base_path = lora_dir  # Always use the default lora_dir
+            all_loras = get_lora(base_path, directories)
+            
+            # Filter to show only checked LoRAs
+            checked_loras = [lora for lora in current_selected if lora in all_loras]
+            
+            return (
+                gr.CheckboxGroup.update(choices=checked_loras, value=checked_loras, visible=len(checked_loras) > 0),
+                gr.Button.update(visible=len(checked_loras) > 0),
+                gr.Button.update(visible=len(checked_loras) > 0)
+            )
+
+        def select_all_visible_loras(current_selected, directories, filter_text=""):
+            """Select all visible LoRAs (filtered or unfiltered)"""
+            base_path = lora_dir  # Always use the default lora_dir
+            all_loras = get_lora(base_path, directories)
+            
+            # Apply filter if filter_text is provided
+            if filter_text.strip():
+                filtered_loras = [lora for lora in all_loras if filter_text.lower() in lora.lower()]
+            else:
+                filtered_loras = all_loras
+            
+            # Preserve existing selections not in current filter and add all visible LoRAs
+            preserved_selections = [lora for lora in current_selected if lora not in filtered_loras]
+            new_selected = preserved_selections + filtered_loras
+            
+            visible = len(filtered_loras) > 0
+            return gr.CheckboxGroup.update(choices=filtered_loras, value=new_selected, visible=visible)
+
+        def clear_all_visible_loras(current_selected, directories, filter_text=""):
+            """Clear all visible LoRAs (filtered or unfiltered)"""
+            base_path = lora_dir  # Always use the default lora_dir
+            all_loras = get_lora(base_path, directories)
+            
+            # Apply filter if filter_text is provided
+            if filter_text.strip():
+                filtered_loras = [lora for lora in all_loras if filter_text.lower() in lora.lower()]
+            else:
+                filtered_loras = all_loras
+            
+            # Keep only selections that are not in the currently visible list
+            new_selected = [lora for lora in current_selected if lora not in filtered_loras]
+            
+            visible = len(filtered_loras) > 0
+            return gr.CheckboxGroup.update(choices=filtered_loras, value=new_selected, visible=visible)
+
+        def sort_alphabetically(directories, filter_text="", current_selected=None):
+            global _alpha_mode, _current_sort_type
+            _current_sort_type = "alpha"
+            _alpha_mode = (_alpha_mode + 1) % 2  # Toggle between A-Z and Z-A
+            
+            # Refresh the LoRA list with new sorting
+            base_path = lora_dir  # Always use the default lora_dir
+            all_loras = get_lora(base_path, directories)
+            
+            # Apply filter if filter_text is provided
+            if filter_text.strip():
+                filtered_loras = [lora for lora in all_loras if filter_text.lower() in lora.lower()]
+            else:
+                filtered_loras = all_loras
+            
+            visible = len(filtered_loras) > 0
+            
+            # Preserve selections if current_selected is provided, otherwise clear selections
+            preserved_selections = []
+            if current_selected is not None:
+                preserved_selections = [lora for lora in current_selected if lora in all_loras]
+            
+            alpha_text = "📝 Alpha (A-Z)" if _alpha_mode == 0 else "📝 Alpha (Z-A)"
+            
+            return (
+                gr.CheckboxGroup.update(choices=filtered_loras, value=preserved_selections, visible=visible),
+                gr.Button.update(value=alpha_text),
+                gr.Button.update(variant="secondary"),
+                gr.Button.update(variant="secondary")
+            )
+
+        def _sort_by_date_mode(directories, filter_text="", current_selected=None, mode=0):
+            global _date_mode, _current_sort_type
+            _current_sort_type = "date"
+            _date_mode = mode
+
+            # Refresh the LoRA list with new sorting
+            base_path = lora_dir  # Always use the default lora_dir
+            all_loras = get_lora(base_path, directories)
+
+            # Apply filter if filter_text is provided
+            if filter_text.strip():
+                filtered_loras = [lora for lora in all_loras if filter_text.lower() in lora.lower()]
+            else:
+                filtered_loras = all_loras
+
+            visible = len(filtered_loras) > 0
+
+            # Preserve selections if current_selected is provided, otherwise clear selections
+            preserved_selections = []
+            if current_selected is not None:
+                preserved_selections = [lora for lora in current_selected if lora in all_loras]
+
+            is_newest = mode == 0
+
+            return (
+                gr.CheckboxGroup.update(choices=filtered_loras, value=preserved_selections, visible=visible),
+                gr.Button.update(variant="primary" if is_newest else "secondary"),
+                gr.Button.update(variant="primary" if not is_newest else "secondary")
+            )
+
+        def sort_by_date_newest(directories, filter_text="", current_selected=None):
+            return _sort_by_date_mode(directories, filter_text, current_selected, mode=0)
+
+        def sort_by_date_oldest(directories, filter_text="", current_selected=None):
+            return _sort_by_date_mode(directories, filter_text, current_selected, mode=1)
+
+        def sort_randomly(directories, filter_text="", current_selected=None):
+            global _current_sort_type
+            _current_sort_type = "random"
+            
+            # Refresh the LoRA list with new sorting
+            base_path = lora_dir  # Always use the default lora_dir
+            all_loras = get_lora(base_path, directories)
+            
+            # Apply filter if filter_text is provided
+            if filter_text.strip():
+                filtered_loras = [lora for lora in all_loras if filter_text.lower() in lora.lower()]
+            else:
+                filtered_loras = all_loras
+            
+            visible = len(filtered_loras) > 0
+            
+            # Preserve selections if current_selected is provided, otherwise clear selections
+            preserved_selections = []
+            if current_selected is not None:
+                preserved_selections = [lora for lora in current_selected if lora in all_loras]
+            
+            return (
+                gr.CheckboxGroup.update(choices=filtered_loras, value=preserved_selections, visible=visible),
+                gr.Button.update(value="🎲 Random"),
+                gr.Button.update(variant="secondary"),
+                gr.Button.update(variant="secondary")
+            )
 
         def deselect_all_lora():
             return gr.CheckboxGroup.update(value=[])
 
-        def toggle_row_number(checked):
-            return gr.Number.update(visible=checked), gr.Checkbox.update(visible=checked)
-
-        def select_lora_tags_position(selected):
-            return gr.CheckboxGroup.update(value=selected)
-
-        def toggle_auto_row_number(checked):
-            return gr.Number.update(interactive=not checked)
-
         with gr.Column():
-            base_dir_checkbox = gr.Checkbox(label="Use Custom Lora path", value=False,
-                                            elem_id=self.elem_id("base_dir_checkbox"))
-            base_dir_textbox = gr.Textbox(label="Lora directory", placeholder="Relative path under Lora directory. Use --lora-dir to set Lora directory at WebUI startup.", visible=False, elem_id=self.elem_id("base_dir_textbox"))
-            base_dir = base_dir_textbox.value if base_dir_checkbox.value else lora_dir
+            gr.HTML("<style>.lora-queue-toolbar{flex-wrap:nowrap!important;gap:0.25rem;}</style>")
+            with gr.Row(elem_classes=["lora-queue-toolbar"]):
+                refresh_button = gr.Button("🔄 Refresh", scale=1, size="extra-small", min_width=0)
+                select_all_lora_button = gr.Button("All", scale=1, size="extra-small", min_width=0)
+                deselect_all_lora_button = gr.Button("Clear", scale=1, size="extra-small", min_width=0)
+                alpha_sort_button = gr.Button("📝 Alpha (A-Z)", scale=1, size="extra-small", min_width=0)
+                date_sort_new_button = gr.Button("📅 New→Old", scale=1, size="extra-small", variant="secondary", min_width=0)
+                date_sort_old_button = gr.Button("📅 Old→New", scale=1, size="extra-small", variant="secondary", min_width=0)
+                random_sort_button = gr.Button("🎲 Random", scale=1, size="extra-small", variant="secondary", min_width=0)
+            
+            base_dir = lora_dir  # Always use the default lora_dir
             all_dirs = get_directories(base_dir)
 
-            directory_checkboxes = gr.CheckboxGroup(label="Select Directory", choices=all_dirs, value=["/"], elem_id=self.elem_id("directory_checkboxes"))
-
-            with gr.Row():
-                select_all_dirs_button = gr.Button("All")
-                deselect_all_dirs_button = gr.Button("Clear")
+            directory_checkboxes = gr.CheckboxGroup(label="Select Directory", choices=all_dirs, value=[], elem_id=self.elem_id("directory_checkboxes"))
 
             startup_loras = get_lora(base_dir, directory_checkboxes.value)
             
-            lora_checkboxes = gr.CheckboxGroup(label="Lora", choices=startup_loras, value=startup_loras, visible=len(startup_loras)>0, elem_id=self.elem_id("lora_checkboxes"))
-
-            lora_tags_position_radio = gr.Radio(label="Lora Tags Position", choices=["Prepend", "Append"], value="Prepend", elem_id=self.elem_id("lora_tag_position_radio"))
-
+            # Add filter textbox with clear button and show checked button
             with gr.Row():
-                select_all_lora_button = gr.Button("All", visible=len(startup_loras)>0)
-                deselect_all_lora_button = gr.Button("Clear", visible=len(startup_loras)>0)
-
-            with gr.Row():
-                checkbox_iterate = gr.Checkbox(label="Use consecutive seed", value=False, elem_id=self.elem_id("checkbox_iterate"))
-                checkbox_iterate_batch = gr.Checkbox(label="Use same random seed", value=False, elem_id=self.elem_id("checkbox_iterate_batch"))
+                lora_filter = gr.Textbox(label="Filter LoRAs", placeholder="Type to filter LoRA names...", value="", elem_id=self.elem_id("lora_filter"))
+                clear_filter_button = gr.Button("Clear Filter", scale=0, size="sm")
+                show_checked_button = gr.Button("Show Checked", scale=0, size="sm")
             
-            with gr.Row():
-                with gr.Column():
-                    checkbox_save_grid = gr.Checkbox(label="Save grid image", value=True, elem_id=self.elem_id("checkbox_save_grid"))
-                    checkbox_auto_row_number = gr.Checkbox(label="Auto row number", value=True, elem_id=self.elem_id("checkbox_auto_row_number"))
-                    checkbox_add_text = gr.Checkbox(label="Add text to grid", value=True, elem_id=self.elem_id("checkbox_add_text"))
+            lora_checkboxes = gr.CheckboxGroup(label="Lora", choices=startup_loras, value=[], visible=len(startup_loras)>0, elem_id=self.elem_id("lora_checkboxes"))
+
+            # Add refresh functionality
+            refresh_button.click(
+                fn=refresh_loras,
+                inputs=[lora_checkboxes, directory_checkboxes, lora_filter],
+                outputs=[directory_checkboxes, lora_checkboxes, select_all_lora_button, deselect_all_lora_button]
+            )
+            directory_checkboxes.change(fn=update_loras, inputs=[lora_checkboxes, directory_checkboxes, lora_filter], outputs=[lora_checkboxes, select_all_lora_button, deselect_all_lora_button])
+            
+            # Add filter functionality
+            lora_filter.change(fn=filter_loras, inputs=[lora_filter, lora_checkboxes, directory_checkboxes], outputs=[lora_checkboxes, select_all_lora_button, deselect_all_lora_button])
+            clear_filter_button.click(fn=clear_filter, inputs=[lora_checkboxes, directory_checkboxes], outputs=[lora_checkboxes, select_all_lora_button, deselect_all_lora_button, lora_filter])
+            show_checked_button.click(fn=show_checked_only, inputs=[lora_checkboxes, directory_checkboxes], outputs=[lora_checkboxes, select_all_lora_button, deselect_all_lora_button])
+            
+            # Update button functionality to work with filtering
+            select_all_lora_button.click(fn=select_all_visible_loras, inputs=[lora_checkboxes, directory_checkboxes, lora_filter], outputs=lora_checkboxes)
+            deselect_all_lora_button.click(fn=clear_all_visible_loras, inputs=[lora_checkboxes, directory_checkboxes, lora_filter], outputs=lora_checkboxes)
+            
+            # Add sorting functionality
+            alpha_sort_button.click(fn=sort_alphabetically, inputs=[directory_checkboxes, lora_filter, lora_checkboxes], outputs=[lora_checkboxes, alpha_sort_button, date_sort_new_button, date_sort_old_button])
+            date_sort_new_button.click(fn=sort_by_date_newest, inputs=[directory_checkboxes, lora_filter, lora_checkboxes], outputs=[lora_checkboxes, date_sort_new_button, date_sort_old_button])
+            date_sort_old_button.click(fn=sort_by_date_oldest, inputs=[directory_checkboxes, lora_filter, lora_checkboxes], outputs=[lora_checkboxes, date_sort_new_button, date_sort_old_button])
+            random_sort_button.click(fn=sort_randomly, inputs=[directory_checkboxes, lora_filter, lora_checkboxes], outputs=[lora_checkboxes, random_sort_button, date_sort_new_button, date_sort_old_button])
+
+        return [directory_checkboxes, lora_checkboxes, lora_filter]
+
+    def process(self, p, *script_args, **kwargs):
+        # Skip if this is a queued processing object
+        if hasattr(p, 'lora_queue_skip'):
+            return
+            
+        if len(script_args) >= 2:
+            directories, selected_loras = script_args[0], script_args[1]
+            self._modify_prompt_for_loras(p, directories, selected_loras)
+        return
+
+    def before_process_batch(self, p, *script_args, **kwargs):
+        # Optional: Add progress feedback for queue processing
+        if hasattr(p, 'lora_queue_info') and p.lora_queue_info:
+            queue_info = p.lora_queue_info
+            if len(queue_info['selected_loras']) > 1:
+                current_lora = queue_info['selected_loras'][0]
+                print(f"LoRA Queue Helper: Generating with {current_lora}...")
+        return
+
+    def postprocess(self, p, processed, *script_args):
+        """Handle queue processing for multiple LoRAs"""
+        # Skip if this is a queued processing object or already processed
+        if hasattr(p, 'lora_queue_skip') or hasattr(p, 'lora_queue_processed'):
+            return processed
+        
+        if not hasattr(p, 'lora_queue_info') or not p.lora_queue_info:
+            return processed
+        
+        # Mark as processed to prevent recursive calls
+        p.lora_queue_processed = True
+        
+        queue_info = p.lora_queue_info
+        selected_loras = queue_info['selected_loras']
+        
+        # If only one LoRA, no queue processing needed
+        if len(selected_loras) <= 1:
+            return processed
+        
+        # Process remaining LoRAs
+        remaining_loras = selected_loras[1:]  # Skip first LoRA (already processed)
+        
+        print(f"LoRA Queue Helper: Starting queue processing for {len(remaining_loras)} remaining LoRAs")
+        
+        # Import here to avoid circular imports
+        from modules.processing import process_images
+        import copy
+        
+        for i, lora in enumerate(remaining_loras):
+            print(f"LoRA Queue Helper: Processing queue item {i+2}/{len(selected_loras)}: {lora}")
+            
+            try:
+                # Create a new processing object for this LoRA
+                p_queue = copy.copy(p)
                 
-                with gr.Column():
-                    grid_row_number = gr.Number(label="Grid row number", value=1, interactive=False, elem_id=self.elem_id("grid_row_number"))
+                # Mark this as a queued item to prevent script from running again
+                p_queue.lora_queue_skip = True
+                
+                # Clear any existing modifications
+                if hasattr(p_queue, 'lora_helper_modified'):
+                    delattr(p_queue, 'lora_helper_modified')
+                if hasattr(p_queue, 'lora_queue_info'):
+                    delattr(p_queue, 'lora_queue_info')
+                
+                # Restore original settings
+                p_queue.prompt = queue_info['original_prompt']
+                p_queue.n_iter = queue_info['original_n_iter']
+                p_queue.batch_size = queue_info['original_batch_size']
+                
+                # Apply this LoRA's prompt modification directly
+                modified_prompt = self._get_lora_prompt_for_single_lora(
+                    queue_info['directories'], 
+                    lora, 
+                    queue_info['original_prompt']
+                )
+                p_queue.prompt = modified_prompt
+                
+                print(f"LoRA Queue Helper: Queue processing {lora} with {queue_info['original_n_iter']} iterations")
+                
+                # Reset progress state for this LoRA
+                state.job_count = queue_info['original_n_iter'] * queue_info['original_batch_size']
+                state.job_no = 0
+                state.sampling_step = 0
+                
+                # Process this LoRA batch
+                queue_processed = process_images(p_queue)
+                
+                # Add results to the main processed object
+                if queue_processed and queue_processed.images:
+                    processed.images.extend(queue_processed.images)
+                    if hasattr(processed, 'all_prompts') and hasattr(queue_processed, 'all_prompts'):
+                        processed.all_prompts.extend(queue_processed.all_prompts)
+                    if hasattr(processed, 'all_negative_prompts') and hasattr(queue_processed, 'all_negative_prompts'):
+                        processed.all_negative_prompts.extend(queue_processed.all_negative_prompts)
+                    if hasattr(processed, 'all_seeds') and hasattr(queue_processed, 'all_seeds'):
+                        processed.all_seeds.extend(queue_processed.all_seeds)
+                    if hasattr(processed, 'all_subseeds') and hasattr(queue_processed, 'all_subseeds'):
+                        processed.all_subseeds.extend(queue_processed.all_subseeds)
+                    
+                    print(f"LoRA Queue Helper: Added {len(queue_processed.images)} images for {lora}")
+                else:
+                    print(f"LoRA Queue Helper: No images generated for {lora}")
+                    
+            except Exception as e:
+                print(f"LoRA Queue Helper: Error processing {lora}: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Clear queue info
+        p.lora_queue_info = None
+        
+        total_images = len(processed.images)
+        expected_images = len(selected_loras) * queue_info['original_n_iter'] * queue_info['original_batch_size']
+        print(f"LoRA Queue Helper: Queue processing complete! Generated {total_images}/{expected_images} total images")
+        
+        return processed
 
-            with gr.Row():
-                font_path = gr.Textbox(label="Custom Font Path", placeholder="Relative path to your .ttf file, base on Lora Directory", elem_id=self.elem_id("font_path"))
-                font_size = gr.Number(label="Font Size", value=20, elem_id=self.elem_id("font_size"))
-            
-            with gr.Row():
-                font_color = gr.Textbox(label="Font Color", value="#FFFFFF", elem_id=self.elem_id("font_color"))
-                stroke_color = gr.Textbox(label="Stroke Color", value="#000000", elem_id=self.elem_id("stroke_color"))
-                stroke_width = gr.Number(label="Stroke Width", value=2, elem_id=self.elem_id("stroke_width"))
-
-            base_dir_checkbox.change(fn=show_dir_textbox, inputs=[base_dir_checkbox, base_dir_textbox], outputs=[base_dir_textbox, directory_checkboxes])
-            base_dir_textbox.change(fn=update_dirs, inputs=[base_dir_checkbox, base_dir_textbox], outputs=[directory_checkboxes])
-            directory_checkboxes.change(fn=update_loras, inputs=[lora_checkboxes, base_dir_checkbox, base_dir_textbox, directory_checkboxes], outputs=[lora_checkboxes, select_all_lora_button, deselect_all_lora_button])
-            select_all_lora_button.click(fn=select_all_lora, inputs=[base_dir_checkbox, base_dir_textbox, directory_checkboxes], outputs=lora_checkboxes)
-            deselect_all_lora_button.click(fn=deselect_all_lora, inputs=None, outputs=lora_checkboxes)
-            select_all_dirs_button.click(fn=select_all_dirs, inputs=[base_dir_checkbox, base_dir_textbox], outputs=directory_checkboxes)
-            deselect_all_dirs_button.click(fn=deselect_all_dirs, inputs=None, outputs=directory_checkboxes)
-            checkbox_save_grid.change(fn=toggle_row_number, inputs=checkbox_save_grid, outputs=[grid_row_number, checkbox_auto_row_number])
-            checkbox_auto_row_number.change(fn=toggle_auto_row_number, inputs=[checkbox_auto_row_number], outputs=grid_row_number)
-            lora_tags_position_radio.change(fn=select_lora_tags_position, inputs=[lora_tags_position_radio], outputs=[])  
-
-        return [base_dir_checkbox, base_dir_textbox, directory_checkboxes, lora_checkboxes, checkbox_iterate, checkbox_iterate_batch, checkbox_save_grid, checkbox_auto_row_number, grid_row_number, font_path, font_size, font_color, stroke_color, stroke_width, checkbox_add_text, lora_tags_position_radio]
-
-    def run(self, p, is_use_custom_path, custom_path, directories, selected_loras, checkbox_iterate, checkbox_iterate_batch, is_save_grid, is_auto_row_number, row_number, font_path, font_size, font_color, stroke_color, stroke_width, checkbox_add_text, lora_tags_position):
+    def _modify_prompt_for_loras(self, p, directories, selected_loras):
+        """Common method to modify prompt with LoRA tags - UI-based queue system"""
+        # Prevent multiple modifications
+        if hasattr(p, 'lora_helper_modified'):
+            return
+        p.lora_helper_modified = True
+        
         if len(selected_loras) == 0:
-            return process_images(p)
+            return
 
-        p.do_not_save_grid = True  # disable default grid image
+        # Store original prompt and settings
+        if not hasattr(p, 'original_prompt_lora_helper'):
+            p.original_prompt_lora_helper = p.prompt
+        
+        # Use the first LoRA for the initial generation
+        first_lora = selected_loras[0]
+        modified_prompt = self._get_lora_prompt_for_single_lora(directories, first_lora, p.original_prompt_lora_helper)
+        p.prompt = modified_prompt
+        
+        # Also update all_prompts array for Forge compatibility
+        if hasattr(p, 'all_prompts') and p.all_prompts:
+            p.all_prompts = [modified_prompt] * len(p.all_prompts)
+        
+        print(f"LoRA Queue Helper: Starting with LoRA 1/{len(selected_loras)}: {first_lora}")
+        print(f"LoRA Queue Helper: Modified prompt: {modified_prompt[:100]}...")
+        
+        # Store queue information for postprocess
+        p.lora_queue_info = {
+            'directories': directories,
+            'selected_loras': selected_loras,
+            'current_lora_index': 0,
+            'original_prompt': p.original_prompt_lora_helper,
+            'original_n_iter': p.n_iter,
+            'original_batch_size': p.batch_size
+        }
+        
+        # Print user-friendly information
+        if len(selected_loras) > 1:
+            total_expected = len(selected_loras) * p.n_iter * p.batch_size
+            print(f"LoRA Queue Helper: Processing {len(selected_loras)} LoRAs in sequence")
+            print(f"LoRA Queue Helper: Expected total images: {total_expected} ({p.n_iter} iterations × {p.batch_size} batch size × {len(selected_loras)} LoRAs)")
+        else:
+            print(f"LoRA Queue Helper: Processing single LoRA: {first_lora}")
+            print(f"LoRA Queue Helper: Modified prompt: {modified_prompt}")
+        
+        print(f"LoRA Queue Helper: Current p.prompt = {p.prompt[:100]}...")
+        if hasattr(p, 'all_prompts'):
+            print(f"LoRA Queue Helper: all_prompts length = {len(p.all_prompts) if p.all_prompts else 0}")
+            print(f"LoRA Queue Helper: Starting with LoRA 1/{len(selected_loras)}: {first_lora}")
+        else:
+            print(f"LoRA Queue Helper: Processing single LoRA: {first_lora}")
 
-        job_count = 0
-        jobs = []
-
-        base_path = get_base_path(is_use_custom_path, custom_path)
-        for directory in directories:
-            # if directory is "/" use base_path
-            directory = base_path if directory == "/" else base_path.joinpath(directory)
-            if not allowed_path(directory):
+    def _get_lora_prompt_for_single_lora(self, directories, selected_lora, original_prompt):
+        """Get the prompt with a single LoRA's tags added"""
+        base_path = lora_dir
+        directories_to_check = directories if directories else [""]
+        
+        for directory in directories_to_check:
+            directory_path = base_path if directory == "" else base_path.joinpath(directory)
+            if not allowed_path(directory_path):
                 continue
-            safetensor_files = [f for f in os.listdir(directory) if f.endswith('.safetensors')]
+            
+            try:
+                safetensor_files = [f for f in os.listdir(directory_path) if f.endswith('.safetensors')]
+            except Exception:
+                continue
 
             for safetensor_file in safetensor_files:
                 lora_filename = os.path.splitext(safetensor_file)[0]
-                if lora_filename not in selected_loras:
+                if lora_filename != selected_lora:
                     continue
-                lora_file_path = directory.joinpath(safetensor_file)
+                    
+                lora_file_path = directory_path.joinpath(safetensor_file)
                 json_file = lora_filename + '.json'
-                json_file_path = directory.joinpath(json_file)
+                json_file_path = directory_path.joinpath(json_file)
 
                 lora_tags = None
                 if os.path.exists(json_file_path):
                     try:
                         lora_tags = get_lora_prompt(lora_file_path, json_file_path)
-                    except Exception as e:
-                        print(f"Lora Queue Helper got error when loading lora info, error: {e}")
+                    except Exception:
+                        pass
                 
                 if lora_tags == None or not isinstance(lora_tags, str):
                     lora_tags = f"<lora:{lora_filename}:1>"
 
-                args = {}
-                if lora_tags_position == "Prepend":
-                    args["prompt"] = lora_tags + ", " + p.prompt
-                elif lora_tags_position == "Append":
-                    if not p.prompt.endswith(','):
-                        args["prompt"] = p.prompt + ", " + lora_tags
-                    else:
-                        args["prompt"] = p.prompt + " " + lora_tags
-                
-                args['lora_name'] = get_lora_name(lora_file_path)
-
-                job_count += args.get("n_iter", p.n_iter)
-
-                jobs.append(args)
-
-        if (checkbox_iterate or checkbox_iterate_batch) and p.seed == -1:
-            p.seed = int(random.randrange(4294967294))
-
-        state.job_count = job_count
-
-        result_images = []
-        all_prompts = []
-        infotexts = []
-        lora_names = []
-
-        for args in jobs:
-            lora_name = args.pop('lora_name')
-            state.job = f"{state.job_no + 1} out of {state.job_count}"
-
-            copy_p = copy.copy(p)
-            for k, v in args.items():
-                setattr(copy_p, k, v)
-
-            proc = process_images(copy_p)
-            result_images += proc.images
-            
-            lora_names.extend([lora_name] * len(proc.images))
-
-            if checkbox_iterate:
-                p.seed = p.seed + (p.batch_size * p.n_iter)
-            all_prompts += proc.all_prompts
-            infotexts += proc.infotexts
-
-        if is_save_grid and len(result_images) > 1:
-            if is_auto_row_number:
-                # get a 4:3 rectangular width
-                row_number = round(3.0 * math.sqrt(len(result_images)/12.0))
-            else:
-                row_number = int(row_number)
-
-            if not allowed_path(font_path):
-                font_path = None
-
-            # Create grid with LoRA names
-            grid_image = image_grid_with_text(
-                result_images, 
-                lora_names, 
-                rows=row_number, 
-                font_path=font_path, 
-                font_size=int(font_size),
-                text_color=font_color,
-                stroke_color=stroke_color,
-                stroke_width=int(stroke_width),
-                add_text=checkbox_add_text
-            )
-
-            images.save_image(grid_image, p.outpath_grids, "Lora Queue Helper", extension=opts.grid_format, prompt=p.prompt, seed=p.seed, grid=True, p=p)
-
-            base_prompt = p.prompt or "Empty"
-            result_images.insert(0, grid_image)
-            all_prompts.insert(0, base_prompt)
-            lora_name_list = '\n'.join(selected_loras)
-            infotexts.insert(0, f"Prompt:\n{base_prompt}\n\nLora:\n{lora_name_list}")
-
-        return Processed(p, result_images, p.seed, infotexts[0], all_prompts=all_prompts, infotexts=infotexts)
+                # Return the modified prompt with this LoRA's tags
+                modified_prompt = lora_tags + ", " + original_prompt
+                return modified_prompt
+        
+        # If LoRA not found, return original prompt
+        return original_prompt
