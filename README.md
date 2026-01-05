@@ -24,6 +24,8 @@ This fork adds a few quality-of-life improvements for browsing and queueing LoRA
 
 Original project: <https://github.com/Yinzo/sd-webui-Lora-queue-helper>
 
+If you prefer the original behavior (without the fork-specific changes), install the upstream extension instead.
+
 ## How to use
 
 1. Locate the **Script** menu in the bottom left corner.
